@@ -34,3 +34,20 @@ git clone https://github.com/jingle77/simple_multi_model_forecaster.git
 
 # 2. Enter the project folder
 cd simple_multi_model_forecaster
+
+# 3. Create a virtual environment
+python -m venv .venv
+
+# 4. Install requirements
+## Windows
+.venv\Scripts\activate
+
+## Linux
+source .venv/bin/activate
+
+# 5. install dependencies
+pip install -r requirements.txt
+
+# 6. run application
+streamlit run app.py
+```
