@@ -338,7 +338,6 @@ def instantiate_model(key: str, include_holidays: bool = False) -> BaseModel:
         return ModelCls(include_holidays=include_holidays)
     return ModelCls()
 
-
 def run_future_forecasts(
     y: pd.Series,
     freq_alias: str,
@@ -349,9 +348,13 @@ def run_future_forecasts(
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Train each selected model on ALL data and forecast next `horizon` steps.
+
     Returns:
-        combined_df: DataFrame with actual + forecasts
-        errors: list of error messages (for models that failed)
+        combined_df: DataFrame indexed by ALL timestamps (history + future),
+                     with columns:
+                       - 'actual' (NaN on future rows)
+                       - 'forecast_<model_key>' for each model.
+        errors: list of error messages (for models that failed).
     """
     if horizon <= 0:
         raise ValueError("Forecast horizon must be positive.")
@@ -363,12 +366,21 @@ def run_future_forecasts(
 
     n_models = len(model_keys)
 
+    # 1) Fit each model and collect its future forecast series
     for i, key in enumerate(model_keys, start=1):
         display_name = MODEL_DISPLAY_NAMES[key]
         try:
             model = instantiate_model(key, include_holidays=include_prophet_holidays)
             model.fit(y, freq_alias)
             fc = model.forecast(horizon)
+
+            # Ensure we have a Series with a proper DatetimeIndex
+            if not isinstance(fc, pd.Series):
+                freq_offset = pd.tseries.frequencies.to_offset(freq_alias)
+                start = y.index[-1] + freq_offset
+                idx = pd.date_range(start=start, periods=horizon, freq=freq_alias)
+                fc = pd.Series(fc, index=idx)
+
             forecasts[key] = fc
         except Exception as e:
             errors.append(f"{display_name} failed: {e}")
@@ -376,16 +388,24 @@ def run_future_forecasts(
         if progress_callback is not None:
             progress_callback(i / n_models)
 
-    combined = pd.DataFrame({"actual": y})
+    # 2) Build full index: union of history + all forecast indices
+    full_index = y.index
+    for fc in forecasts.values():
+        full_index = full_index.union(fc.index)
+    full_index = full_index.sort_values()
+
+    # 3) Build combined DataFrame on full_index
+    combined = pd.DataFrame(index=full_index)
+
+    # Actuals: NaN beyond the last observed point
+    combined["actual"] = y.reindex(full_index)
+
+    # Forecasts: aligned to full_index (will naturally live on future rows)
     for key, fc in forecasts.items():
         col_name = f"forecast_{key}"
-        hist_part = pd.Series(np.nan, index=y.index)
-        full_series = pd.concat([hist_part, fc])
-        combined[col_name] = full_series
+        combined[col_name] = fc.reindex(full_index)
 
-    combined = combined.sort_index()
     return combined, errors
-
 
 def run_backtest_forecasts(
     y: pd.Series,

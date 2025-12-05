@@ -1,7 +1,5 @@
 # app.py
-
 import datetime as dt
-
 import altair as alt
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +17,6 @@ from src import (
     split_backtest_date_range,
     split_backtest_last_n,
 )
-
 
 def main():
     st.set_page_config(
@@ -268,13 +265,20 @@ def main():
                 and len(display_range) == 2
             ):
                 view_start_date, view_end_date = sorted(display_range)
+
+                # Interpret the start date as at 00:00:00
                 view_start_ts = pd.Timestamp(view_start_date)
-                view_end_ts = pd.Timestamp(view_end_date)
+                # Interpret the end date as end-of-day (23:59:59.999999)
+                view_end_ts = (
+                    pd.Timestamp(view_end_date)
+                    + pd.Timedelta(days=1)
+                    - pd.Timedelta(microseconds=1)
+                )
             else:
                 view_start_ts = combined_df.index.min()
                 view_end_ts = combined_df.index.max()
 
-            # Filter combined_df to display window
+            # Filter combined_df to display window (now inclusive of full days)
             mask = (combined_df.index >= view_start_ts) & (
                 combined_df.index <= view_end_ts
             )
