@@ -1,5 +1,7 @@
 # app.py
+
 import datetime as dt
+
 import altair as alt
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,6 +19,7 @@ from src import (
     split_backtest_date_range,
     split_backtest_last_n,
 )
+
 
 def main():
     st.set_page_config(
@@ -85,6 +88,22 @@ def main():
                 # Store in session_state for other tabs
                 st.session_state["y_series"] = y_series
                 st.session_state["freq_alias"] = freq_alias
+
+                # --- Seasonality & calendar feature options ---
+                st.subheader("Seasonality & Calendar Features")
+
+                use_calendar_features = st.checkbox(
+                    "Add day-of-week / month / quarter features to lag-based models (Linear & XGBoost)",
+                    value=True,
+                )
+
+                use_thanksgiving_window = st.checkbox(
+                    "Add Thanksgiving → Cyber Monday window features (incl. 2-week lead-up)",
+                    value=True,
+                )
+
+                st.session_state["use_calendar_features"] = use_calendar_features
+                st.session_state["use_thanksgiving_window"] = use_thanksgiving_window
 
                 # Mode: Future vs Backtest
                 mode = st.radio(
@@ -182,6 +201,9 @@ def main():
                             def progress_cb(frac: float):
                                 progress_bar.progress(frac)
 
+                            use_calendar_features = st.session_state["use_calendar_features"]
+                            use_thanksgiving_window = st.session_state["use_thanksgiving_window"]
+
                             if mode == "Future Forecast":
                                 combined_df, errors = run_future_forecasts(
                                     y_series,
@@ -189,6 +211,8 @@ def main():
                                     int(st.session_state["horizon"]),
                                     selected_model_keys,
                                     include_prophet_holidays,
+                                    use_calendar_features=use_calendar_features,
+                                    use_thanksgiving_window=use_thanksgiving_window,
                                     progress_callback=progress_cb,
                                 )
                                 metrics_df = None
@@ -219,6 +243,8 @@ def main():
                                         y_test,
                                         selected_model_keys,
                                         include_prophet_holidays,
+                                        use_calendar_features=use_calendar_features,
+                                        use_thanksgiving_window=use_thanksgiving_window,
                                         progress_callback=progress_cb,
                                     )
                                 )
@@ -247,6 +273,10 @@ def main():
             mode = st.session_state.get("mode", "Future Forecast")
             metrics_df = st.session_state.get("metrics_df", None)
             backtest_index = st.session_state.get("backtest_index", None)
+
+            # Debug expander if needed
+            # with st.expander("Debug: combined_df tail()"):
+            #     st.dataframe(combined_df.tail(30))
 
             # Dynamic display window selection
             full_min_date = combined_df.index.min().date()
@@ -331,7 +361,7 @@ def main():
                         "series:N",
                         title=None,
                         legend=alt.Legend(
-                            orient="bottom",          # legend BELOW chart
+                            orient="bottom",
                             direction="horizontal",
                             columns=legend_ncol,
                         ),
@@ -424,6 +454,12 @@ def main():
             include_prophet_holidays = st.session_state.get(
                 "include_prophet_holidays", False
             )
+            use_calendar_features = st.session_state.get(
+                "use_calendar_features", False
+            )
+            use_thanksgiving_window = st.session_state.get(
+                "use_thanksgiving_window", False
+            )
 
             min_date = y_series.index.min().date()
             max_date = y_series.index.max().date()
@@ -479,6 +515,8 @@ def main():
                             include_prophet_holidays,
                             int(n_sims),
                             metric_type,
+                            use_calendar_features=use_calendar_features,
+                            use_thanksgiving_window=use_thanksgiving_window,
                             progress_callback=mc_cb,
                         )
 

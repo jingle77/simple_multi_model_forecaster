@@ -1,65 +1,27 @@
 # src/data_utils.py
 
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 
 
-DEFAULT_ROLLING_DAILY = 7
-DEFAULT_ROLLING_HOURLY = 24
-
-DEFAULT_LAG_DAILY = 14
-DEFAULT_LAG_HOURLY = 48
-
-MIN_TRAIN_POINTS = 20  # minimal points required for more complex models
-
-
-def infer_freq_label_from_raw(dt_series: pd.Series) -> Optional[str]:
+def infer_freq_label_from_raw(dt_series: pd.Series) -> str:
     """
-    Try to infer frequency from raw datetime series.
-    Return 'Daily', 'Hourly', or None if unclear.
+    Crude frequency inference: 'Hourly' if median delta <= 2 hours, else 'Daily'.
     """
-    dt_series = pd.to_datetime(dt_series.dropna()).sort_values()
-    try:
-        freq = pd.infer_freq(dt_series)
-    except ValueError:
-        freq = None
-
-    if freq is None:
-        return None
-
-    if "H" in freq:
-        return "Hourly"
-    if "D" in freq or "B" in freq:
+    dt_parsed = pd.to_datetime(dt_series, errors="coerce")
+    dt_parsed = dt_parsed.dropna().sort_values()
+    if len(dt_parsed) < 3:
         return "Daily"
-    return None
 
+    deltas = dt_parsed.diff().dropna()
+    median_delta = deltas.median()
 
-def get_seasonal_period(freq_alias: str) -> int:
-    """Return seasonal period depending on frequency."""
-    if freq_alias == "D":
-        return 7  # weekly
-    if freq_alias == "H":
-        return 24  # daily
-    return 7
-
-
-def get_default_rolling_window(freq_alias: str) -> int:
-    if freq_alias == "D":
-        return DEFAULT_ROLLING_DAILY
-    if freq_alias == "H":
-        return DEFAULT_ROLLING_HOURLY
-    return DEFAULT_ROLLING_DAILY
-
-
-def get_default_lag(freq_alias: str) -> int:
-    if freq_alias == "D":
-        return DEFAULT_LAG_DAILY
-    if freq_alias == "H":
-        return DEFAULT_LAG_HOURLY
-    return DEFAULT_LAG_DAILY
+    if median_delta <= pd.Timedelta(hours=2):
+        return "Hourly"
+    return "Daily"
 
 
 def preprocess_data(
@@ -69,45 +31,50 @@ def preprocess_data(
     freq_label: str,
 ) -> Tuple[pd.Series, str, int]:
     """
-    Parse datetime, coerce KPI to numeric, sort, set index,
-    resample to regular daily/hourly frequency, and forward-fill.
+    Parse datetime column, coerce KPI column to numeric, sort, set index,
+    and resample to regular frequency (Daily/Hourly) with simple interpolation.
 
     Returns:
-        y_series: pd.Series with DatetimeIndex
-        freq_alias: 'D' or 'H'
-        dropped_count: number of rows dropped due to non-numeric KPI
+      y_series: pd.Series indexed by DatetimeIndex
+      freq_alias: 'D' or 'H'
+      dropped_rows: count of rows dropped due to non-numeric KPI
     """
-    df = df.copy()
+    if dt_col not in df.columns:
+        raise ValueError(f"Datetime column '{dt_col}' not in DataFrame.")
+    if y_col not in df.columns:
+        raise ValueError(f"KPI column '{y_col}' not in DataFrame.")
 
-    # Parse datetime
-    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-    df = df.dropna(subset=[dt_col])
+    dt_parsed = pd.to_datetime(df[dt_col], errors="coerce")
+    df = df.copy()
+    df["_dt_parsed"] = dt_parsed
+    df = df.dropna(subset=["_dt_parsed"])
+
+    if df.empty:
+        raise ValueError("No valid datetime values after parsing.")
 
     # Coerce KPI to numeric
-    df[y_col] = pd.to_numeric(df[y_col], errors="coerce")
-    dropped = int(df[y_col].isna().sum())
-    df = df.dropna(subset=[y_col])
+    y_numeric = pd.to_numeric(df[y_col], errors="coerce")
+    dropped_rows = int((y_numeric.isna()).sum())
+    df["_y_numeric"] = y_numeric
+    df = df.dropna(subset=["_y_numeric"])
+
     if df.empty:
-        raise ValueError("No valid rows left after parsing KPI column.")
+        raise ValueError("No valid numeric KPI values after coercion.")
 
-    # Sort and index
-    df = df.sort_values(dt_col)
-    df = df.set_index(dt_col)
+    df = df.sort_values("_dt_parsed")
+    series = pd.Series(df["_y_numeric"].values, index=pd.DatetimeIndex(df["_dt_parsed"]))
 
-    if freq_label == "Daily":
-        freq_alias = "D"
-    else:
-        freq_alias = "H"
+    freq_alias = "D" if freq_label == "Daily" else "H"
 
-    # Resample to regular grid and forward fill
-    y = df[[y_col]].resample(freq_alias).mean()
-    y[y_col] = y[y_col].ffill()
+    # Resample to a regular grid and interpolate
+    series = (
+        series.resample(freq_alias)
+        .mean()
+        .interpolate(method="time")
+    )
 
-    if y.empty:
-        raise ValueError("Resampled time series is empty.")
-
-    y_series = y[y_col]
-    return y_series, freq_alias, dropped
+    series.name = y_col
+    return series, freq_alias, dropped_rows
 
 
 def split_backtest_date_range(
@@ -116,135 +83,123 @@ def split_backtest_date_range(
     end_date: dt.date,
 ) -> Tuple[pd.Series, pd.Series]:
     """
-    Split y into train and test using calendar date range.
-    Train: all data strictly before backtest start.
-    Test: start_date to end_date (inclusive).
+    Split series into train (before start_date) and test (start_date..end_date, inclusive).
     """
+    idx = y.index
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
 
-    y_test = y.loc[start_ts:end_ts]
-    if y_test.empty:
-        raise ValueError("Backtest window has no data after alignment.")
+    if start_ts <= idx.min():
+        raise ValueError("Backtest start date must be after the first observation.")
 
-    y_train = y[y.index < y_test.index[0]]
-    if y_train.empty:
-        raise ValueError("Not enough data before backtest start for training.")
+    train_mask = idx < start_ts
+    test_mask = (idx >= start_ts) & (idx <= end_ts)
+
+    y_train = y.loc[train_mask]
+    y_test = y.loc[test_mask]
+
+    if y_train.empty or y_test.empty:
+        raise ValueError("Backtest split produced empty train or test set.")
 
     return y_train, y_test
 
 
 def split_backtest_last_n(
     y: pd.Series,
-    n_points: int,
+    n: int,
 ) -> Tuple[pd.Series, pd.Series]:
     """
-    Split y using last N points as backtest window.
+    Split series into train (all but last n points) and test (last n points).
     """
-    if n_points <= 0:
-        raise ValueError("N must be positive.")
-    if n_points >= len(y):
-        raise ValueError("N must be smaller than total number of observations.")
+    if n <= 0:
+        raise ValueError("n must be positive.")
+    if len(y) <= n:
+        raise ValueError("Not enough data to hold out last n points.")
 
-    y_test = y.iloc[-n_points:]
-    y_train = y.iloc[:-n_points]
+    y_train = y.iloc[:-n]
+    y_test = y.iloc[-n:]
     return y_train, y_test
 
 
-def compute_error_metrics(
-    actual: pd.Series,
-    forecast: pd.Series,
-) -> Dict[str, float]:
+# ----------------------------------------------------------------------
+# Calendar / holiday feature helpers
+# ----------------------------------------------------------------------
+
+
+def _us_thanksgiving(year: int) -> dt.date:
     """
-    Compute ME, MAE, RMSE, MAPE between actual and forecast.
+    US Thanksgiving = fourth Thursday in November.
+    Returns a date object.
     """
-    errors = forecast - actual
-    me = errors.mean()
-    mae = errors.abs().mean()
-    rmse = np.sqrt((errors ** 2).mean())
-
-    denom = actual.replace(0, np.nan).abs()
-    mape = (errors.abs() / denom).mean() * 100
-    mape = float(mape) if not np.isnan(mape) else np.nan
-
-    return {
-        "ME": float(me),
-        "MAE": float(mae),
-        "RMSE": float(rmse),
-        "MAPE": mape,
-    }
+    d = dt.date(year, 11, 1)
+    # weekday: Monday=0, Sunday=6; Thursday=3
+    days_to_thursday = (3 - d.weekday()) % 7
+    first_thursday = d + dt.timedelta(days=days_to_thursday)
+    thanksgiving = first_thursday + dt.timedelta(weeks=3)
+    return thanksgiving
 
 
-def build_lagged_supervised(
-    y: pd.Series,
-    max_lag: int,
-    add_calendar: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+def _cyber_monday(thanksgiving: dt.date) -> dt.date:
     """
-    Build a supervised dataset with lag features (and optional calendar features).
-
-    For each time t:
-        features: y(t-1), ..., y(t-max_lag), [dayofweek, hour]
-        target: y(t)
+    Cyber Monday = Monday after Thanksgiving.
+    Thanksgiving is Thursday, so Monday is +4 days.
     """
-    df = pd.DataFrame({"y": y})
-    for lag in range(1, max_lag + 1):
-        df[f"lag_{lag}"] = df["y"].shift(lag)
-
-    if add_calendar:
-        df["dayofweek"] = df.index.dayofweek
-        df["hour"] = df.index.hour
-
-    df = df.dropna()
-    if df.empty:
-        raise ValueError("Not enough data to build lagged supervised dataset.")
-
-    y_target = df["y"].values
-    X = df.drop(columns=["y"]).values
-    idx = df.index
-    return X, y_target, idx
+    return thanksgiving + dt.timedelta(days=4)
 
 
-def recursive_forecast_regressor(
-    model,
-    y_train: pd.Series,
-    steps: int,
-    max_lag: int,
-    freq_alias: str,
-    add_calendar: bool = True,
-) -> pd.Series:
+def build_calendar_feature_frame(
+    index: pd.DatetimeIndex,
+    include_calendar: bool = True,
+    include_thanksgiving_window: bool = True,
+) -> pd.DataFrame:
     """
-    Recursive multi-step forecast for lag-based models.
-    At each step, use last max_lag values (including previous predictions)
-    and optional calendar features.
+    Given a DatetimeIndex, build a DataFrame of calendar/holiday features:
+
+      - dow (0=Mon,...,6=Sun)
+      - is_weekend (Sat/Sun)
+      - month (1-12)
+      - quarter (1-4)
+      - is_thanksgiving_to_cyber_monday (1 if date ∈ [Thanksgiving, Cyber Monday])
+      - is_pre_thanksgiving_window (1 if date ∈ [tg-14, tg-1])
+
+    Works for both daily and hourly data (we use the .date() part).
     """
-    if len(y_train) < max_lag:
-        raise ValueError("Training series shorter than required lag length.")
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.DatetimeIndex(index)
 
-    freq_offset = pd.tseries.frequencies.to_offset(freq_alias)
-    last_ts = y_train.index[-1]
-    future_index = pd.date_range(
-        start=last_ts + freq_offset,
-        periods=steps,
-        freq=freq_alias,
-    )
+    df = pd.DataFrame(index=index)
 
-    history_values = list(y_train.values)
-    preds = []
+    # Basic calendar features
+    if include_calendar:
+        df["dow"] = index.dayofweek
+        df["is_weekend"] = df["dow"].isin([5, 6]).astype(int)
+        df["month"] = index.month
+        df["quarter"] = index.quarter
 
-    for ts in future_index:
-        if len(history_values) < max_lag:
-            raise ValueError("Insufficient history during recursive forecast.")
+    # Thanksgiving windows
+    if include_thanksgiving_window:
+        dates = index.date
+        years = sorted({d.year for d in dates})
+        tg_by_year = {year: _us_thanksgiving(year) for year in years}
+        cm_by_year = {year: _cyber_monday(tg_by_year[year]) for year in years}
 
-        lag_features = history_values[-max_lag:]
-        features = lag_features.copy()
-        if add_calendar:
-            features.append(ts.dayofweek)
-            features.append(ts.hour)
+        is_thanksgiving_to_cyber = []
+        is_pre_window = []
 
-        X_step = np.array(features).reshape(1, -1)
-        y_pred = float(model.predict(X_step)[0])
-        preds.append(y_pred)
-        history_values.append(y_pred)
+        for d in dates:
+            tg = tg_by_year[d.year]
+            cm = cm_by_year[d.year]
 
-    return pd.Series(preds, index=future_index)
+            in_tg_cm = 1 if (tg <= d <= cm) else 0
+
+            pre_start = tg - dt.timedelta(days=14)
+            pre_end = tg - dt.timedelta(days=1)
+            in_pre = 1 if (pre_start <= d <= pre_end) else 0
+
+            is_thanksgiving_to_cyber.append(in_tg_cm)
+            is_pre_window.append(in_pre)
+
+        df["is_thanksgiving_to_cyber_monday"] = np.array(is_thanksgiving_to_cyber, dtype=int)
+        df["is_pre_thanksgiving_window"] = np.array(is_pre_window, dtype=int)
+
+    return df
